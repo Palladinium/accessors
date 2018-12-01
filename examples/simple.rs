@@ -1,16 +1,16 @@
-#![feature(proc_macro)]
-
 #[macro_use]
 extern crate accessors;
 
 #[derive(getters, setters)]
-#[setters(into)]
 struct Simple {
+    #[setter(into)]
     field: String,
 }
 
 fn main() {
-    let mut s = Simple { field: "hello".to_owned() };
+    let mut s = Simple {
+        field: "hello".to_owned(),
+    };
     println!("{}", s.field());
     s.set_field("there");
 }

@@ -3,95 +3,84 @@
 //!
 //! [example code]: https://github.com/dtolnay/syn
 
-#![feature(proc_macro, proc_macro_lib)]
-
 // I threw this code together in just a few minutes, and it could use a
 // good refactoring once I figure out the basic ideas.  Do not use use this
 // as an example of good style.
 
-#[macro_use]
-extern crate log;
 extern crate proc_macro;
+extern crate proc_macro2;
 #[macro_use]
 extern crate quote;
 extern crate syn;
 
 use proc_macro::TokenStream;
+use proc_macro2::Span;
 use std::collections::BTreeMap;
+use syn::{Field, Lit, LitBool, Meta, NestedMeta};
 
-#[proc_macro_derive(getters)]
+#[proc_macro_derive(getters, attributes(getter))]
 pub fn derive_getters(input: TokenStream) -> TokenStream {
-    let ast = syn::parse_macro_input(&input.to_string()).unwrap();
-    let expanded = expand_getters(ast);
-    expanded.to_string().parse().unwrap()
-}
+    let ast: syn::DeriveInput = syn::parse(input).unwrap();
 
-fn expand_getters(mut ast: syn::MacroInput) -> quote::Tokens {
-    // println!("Defining getters for: {:#?}", ast);
-
-    extract_attrs(&mut ast.attrs, "getters");
-
-    let fields: Vec<_> = match ast.body {
-        syn::Body::Struct(syn::VariantData::Struct(ref fields)) => {
-            fields.iter().map(|f| (f.ident.as_ref().unwrap(), &f.ty)).collect()
-        }
+    let fields: Vec<_> = match ast.data {
+        syn::Data::Struct(ref s) => s
+            .fields
+            .iter()
+            .map(|f| (f.ident.as_ref().unwrap(), &f.ty, GetterConfig::new(&f)))
+            .collect(),
         _ => panic!("#[derive(getters)] can only be used with braced structs"),
     };
 
     let name = &ast.ident;
-    let (impl_generics, ty_generics, where_clause) = ast.generics
-        .split_for_impl();
-    let getter: Vec<_> = fields.iter().map(|f| f.0).collect();
-    let field: Vec<_> = fields.iter().map(|f| f.0).collect();
-    let ty: Vec<_> = fields.iter().map(|f| f.1).collect();
+    let (impl_generics, ty_generics, where_clause) =
+        ast.generics.split_for_impl();
 
-    quote! {
-        #ast
+    let getters: Vec<_> = fields
+        .iter()
+        .map(|&(ref field_name, ref ty, ref _config)| {
+            let get_fn_name = field_name;
 
-        impl #impl_generics #name #ty_generics #where_clause {
-            #(
-                pub fn #getter(&self) -> &#ty {
-                    &self.#field
+            quote! {
+                pub fn #get_fn_name(&self) -> &#ty {
+                    &self.#field_name
                 }
-            )*
+            }
+        })
+        .collect();
+
+    let expanded = quote! {
+        impl #impl_generics #name #ty_generics #where_clause {
+            #(#getters)*
         }
-    }
-}
-
-#[proc_macro_derive(setters)]
-pub fn derive_setters(input: TokenStream) -> TokenStream {
-    let ast = syn::parse_macro_input(&input.to_string()).unwrap();
-    let expanded = expand_setters(ast);
-    // println!("Expanded: {}", expanded.to_string());
-    expanded.to_string().parse().unwrap()
-}
-
-fn expand_setters(mut ast: syn::MacroInput) -> quote::Tokens {
-    // println!("Defining setters for: {:#?}", ast);
-
-    let setters_attrs = extract_attrs(&mut ast.attrs, "setters");
-    let config = config_from(&setters_attrs, &["into"]);
-    // println!("Config: {:#?}", &config);
-    let into_default = syn::Lit::Bool(false);
-    let into = match *config.get("into").unwrap_or(&into_default) {
-        syn::Lit::Bool(b) => b,
-        ref val => panic!("'into' must be a boolean value, not {:?}", val),
     };
 
-    let fields: Vec<_> = match ast.body {
-        syn::Body::Struct(syn::VariantData::Struct(ref fields)) => {
-            fields.iter().map(|f| (f.ident.as_ref().unwrap(), &f.ty)).collect()
-        }
+    expanded.into()
+}
+
+#[proc_macro_derive(setters, attributes(setter))]
+pub fn derive_setters(input: TokenStream) -> TokenStream {
+    let ast: syn::DeriveInput = syn::parse(input).unwrap();
+
+    let fields: Vec<_> = match ast.data {
+        syn::Data::Struct(ref s) => s
+            .fields
+            .iter()
+            .map(|f| (f.ident.as_ref().unwrap(), &f.ty, SetterConfig::new(&f)))
+            .collect(),
         _ => panic!("#[derive(setters)] can only be used with braced structs"),
     };
 
     let name = &ast.ident;
-    let (impl_generics, ty_generics, where_clause) = ast.generics
-        .split_for_impl();
-    let setters: Vec<_> = fields.iter()
-        .map(|&(ref field_name, ref ty)| {
-            let set_fn_name: syn::Ident = format!("set_{}", field_name).into();
-            if into {
+    let (impl_generics, ty_generics, where_clause) =
+        ast.generics.split_for_impl();
+    let setters: Vec<_> = fields
+        .iter()
+        .map(|&(ref field_name, ref ty, ref config)| {
+            let set_fn_name = syn::Ident::new(
+                &format!("set_{}", field_name),
+                Span::call_site(),
+            );
+            if config.into {
                 quote! {
                     pub fn #set_fn_name<T>(&mut self, value: T)
                         where T: Into<#ty>
@@ -109,48 +98,81 @@ fn expand_setters(mut ast: syn::MacroInput) -> quote::Tokens {
         })
         .collect();
 
-    quote! {
-        #ast
-
+    let expanded = quote! {
         impl #impl_generics #name #ty_generics #where_clause {
             #(#setters)*
         }
+    };
+
+    expanded.into()
+}
+
+struct SetterConfig {
+    into: bool,
+}
+
+impl SetterConfig {
+    fn new(field: &Field) -> Self {
+        let config = extract_attr(field, "setter");
+
+        let into = config.get("into").map(extract_bool).unwrap_or(false);
+
+        Self { into }
     }
 }
 
-fn extract_attrs(attrs: &mut Vec<syn::Attribute>,
-                 name: &str)
-                 -> Vec<syn::Attribute> {
-    let extracted =
-        attrs.iter().filter(|a| a.name() == name).cloned().collect();
-    attrs.retain(|a| a.name() != name);
-    extracted
+struct GetterConfig {}
+
+impl GetterConfig {
+    fn new(_field: &Field) -> Self {
+        Self {}
+    }
 }
 
-fn config_from(attrs: &[syn::Attribute],
-               keys: &[&str])
-               -> BTreeMap<String, syn::Lit> {
-    let mut result = BTreeMap::new();
-    for attr in attrs {
-        if let syn::MetaItem::List(_, ref args) = attr.value {
-            for arg in args {
-                let name = arg.name();
-                if !keys.contains(&name) {
-                    panic!("'{}' in {:?} is not a known attribute", name, attr);
-                }
-                match *arg {
-                    syn::MetaItem::Word(_) => {
-                        result.insert(name.to_owned(), syn::Lit::Bool(true));
-                    }
-                    syn::MetaItem::NameValue(_, ref value) => {
-                        result.insert(name.to_owned(), value.to_owned());
-                    }
-                    _ => panic!("can't parse '{:?}'", &arg),
-                }
-            }
-        } else {
-            panic!("{:?} must be a key-value attribute", attr);
-        }
+fn extract_bool(lit: &Lit) -> bool {
+    if let Lit::Bool(LitBool { value, .. }) = lit {
+        value.clone()
+    } else {
+        panic!("Expected bool");
     }
-    result
+}
+
+fn extract_attr(field: &Field, name: &str) -> BTreeMap<String, Lit> {
+    let matching_meta_lists: Vec<_> = field
+        .attrs
+        .iter()
+        .filter(|a| match a.style {
+            syn::AttrStyle::Outer => true,
+            _ => false,
+        })
+        .filter_map(|a| a.interpret_meta())
+        .filter(|m| m.name() == name)
+        .filter_map(|m| match m {
+            Meta::List(l) => Some(l),
+            _ => None,
+        })
+        .collect();
+
+    match matching_meta_lists.len() {
+        0 => BTreeMap::new(),
+        1 => matching_meta_lists[0]
+            .nested
+            .iter()
+            .map(|e| match e {
+                NestedMeta::Meta(Meta::Word(ref ident)) => (
+                    ident.to_string(),
+                    Lit::Bool(LitBool {
+                        value: true,
+                        span: Span::call_site(),
+                    }),
+                ),
+                NestedMeta::Meta(Meta::NameValue(ref kv)) => {
+                    (kv.ident.to_string(), kv.lit.clone())
+                }
+
+                _ => panic!("Malformed {} attribute", name),
+            })
+            .collect(),
+        _ => panic!("Expected at most one {} attribute", name),
+    }
 }
