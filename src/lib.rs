@@ -131,7 +131,7 @@ impl GetterConfig {
 
 fn extract_bool(lit: &Lit) -> bool {
     if let Lit::Bool(LitBool { value, .. }) = lit {
-        value.clone()
+        *value
     } else {
         panic!("Expected bool");
     }
